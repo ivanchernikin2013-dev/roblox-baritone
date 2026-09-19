@@ -1,8 +1,15 @@
+-- ============================================================
+-- Herkle Baritone v1.4.0
+-- Walk-only baritone for Booga Booga Reborn
+-- GitHub: ivanchernikin2013-dev/roblox-baritone
+-- ============================================================
+
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local plr = Players.LocalPlayer
 
 local Baritone = {}
-Baritone.Version = "1.3.0"
+Baritone.Version = "1.4.0"
 
 local DEFAULTS = {
     walkSpeed = 14,
@@ -22,7 +29,7 @@ local DEFAULTS = {
     targetSearchInterval = 0.5,
     wanderInterval = 4,
     enabled = false,
-    debug = false,
+    debug = true,
     TREE_NAMES = {
         ["Small Tree"]=true, ["Apple Tree"]=true, ["Orange Tree"]=true,
         ["Lemon Tree"]=true, ["Banana Tree"]=true, ["Coconut Tree"]=true,
@@ -103,10 +110,6 @@ local function checkWaterAt(pos)
     return false
 end
 
-local function isInWater(myRoot)
-    return myRoot and checkWaterAt(myRoot.Position)
-end
-
 -- ============================================================
 -- STATE
 -- ============================================================
@@ -117,20 +120,23 @@ local state = {
     currentDir = nil,
     pendingJump = false,
     lastJump = 0,
-    lastY = nil,
-    yDropTimer = 0,
-    stuckTimer = 0,
     lastPos = nil,
-    lastDirUpdate = 0,
+    lastMoveMethod = "move",
+    methodSwitchUntil = 0,
     lastTargetSearch = 0,
+    lastDirUpdate = 0,
     escapeUntil = 0,
     wanderDir = nil,
     wanderChangeAt = 0,
     stopCallbacks = {},
+    moveFailCount = 0,
+    lastLogTime = 0,
 }
 
 local function bd(msg)
-    if Config.debug then print("[Baritone]", msg) end
+    if Config.debug then
+        print("[Baritone] " .. msg)
+    end
 end
 
 -- ============================================================
@@ -212,7 +218,6 @@ local function evaluateDirection(myRoot, dir, inWater)
         end
     end
 
-    -- Штраф за воду ТОЛЬКО если уже НЕ в воде
     if Config.avoidWater and not inWater then
         local ahead = myRoot.Position + dir * 2
         if checkWaterAt(ahead) then
@@ -225,7 +230,7 @@ end
 
 local function findBestDirection(myRoot, goalDir)
     if not goalDir then return nil, false end
-    local inWater = isInWater(myRoot)
+    local inWater = checkWaterAt(myRoot.Position)
     local bestDir = nil
     local bestScore = -math.huge
     local bestJump = false
@@ -246,9 +251,63 @@ local function findBestDirection(myRoot, goalDir)
         end
     end
 
-    -- Никогда не возвращаем nil — всегда едем хоть куда-то
     if not bestDir then return goalDir, false end
     return bestDir, bestJump
+end
+
+-- ============================================================
+-- MOVEMENT METHODS
+-- ============================================================
+local function moveMove(humanoid, myRoot, dir)
+    humanoid:Move(dir, false)
+end
+
+local function moveMoveTo(humanoid, myRoot, dir)
+    humanoid:MoveTo(myRoot.Position + dir * 12)
+end
+
+local function moveVelocity(myRoot, dir)
+    local bv = myRoot:FindFirstChild("__BaritoneBV")
+    if not bv then
+        bv = Instance.new("BodyVelocity")
+        bv.Name = "__BaritoneBV"
+        bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+        bv.P = 5000
+        bv.Parent = myRoot
+    end
+    bv.Velocity = Vector3.new(dir.X, 0, dir.Z) * Config.walkSpeed
+end
+
+local function clearVelocity(myRoot)
+    if not myRoot then return end
+    local bv = myRoot:FindFirstChild("__BaritoneBV")
+    if bv then bv:Destroy() end
+end
+
+local function moveHumanoid(humanoid, myRoot, dir)
+    -- Смена метода раз в 2 сек если застрял
+    if tick() < state.methodSwitchUntil then
+        if state.lastMoveMethod == "velocity" then
+            moveVelocity(myRoot, dir)
+        elseif state.lastMoveMethod == "moveto" then
+            moveMoveTo(humanoid, myRoot, dir)
+        else
+            moveMove(humanoid, myRoot, dir)
+        end
+        return
+    end
+
+    -- Обычный режим - Move
+    clearVelocity(myRoot)
+    state.lastMoveMethod = "move"
+    moveMove(humanoid, myRoot, dir)
+end
+
+local function stopHumanoid(humanoid, myRoot)
+    clearVelocity(myRoot)
+    if humanoid then
+        humanoid:Move(Vector3.zero, false)
+    end
 end
 
 -- ============================================================
@@ -276,26 +335,21 @@ local function findEscapeDirection(myRoot)
 end
 
 -- ============================================================
--- MOVE
--- ============================================================
-local function moveHumanoid(humanoid, myRoot, dir)
-    if not humanoid or not myRoot or not dir then return end
-    local hs = humanoid:GetState()
-    if hs == Enum.HumanoidStateType.Swimming
-        or hs == Enum.HumanoidStateType.Freefall
-        or hs == Enum.HumanoidStateType.FallingDown
-        or hs == Enum.HumanoidStateType.Climbing then
-        humanoid:MoveTo(myRoot.Position + dir * 12)
-    else
-        humanoid:Move(dir, false)
-    end
-end
-
--- ============================================================
 -- MAIN TICK
 -- ============================================================
 local function tick()
     if not Config.enabled then return end
+
+    if Baritone._resetWander then
+        Baritone._resetWander = false
+        state.currentTarget = nil
+        state.currentDir = nil
+        state.wanderDir = nil
+        state.wanderChangeAt = 0
+        state.lastPos = nil
+        state.moveFailCount = 0
+        bd("wander reset")
+    end
 
     local myRoot = getRoot()
     local humanoid = getHumanoid()
@@ -304,23 +358,27 @@ local function tick()
 
     local now = tick()
     local myY = myRoot.Position.Y
+    local myPos = myRoot.Position
 
-    -- Falling detection
-    if state.lastY then
-        local dY = state.lastY - myY
-        if dY > 0.3 then
-            state.yDropTimer = state.yDropTimer + Config.tickRate
+    -- Detecting stuck: движение < 0.15 за тик
+    if state.lastPos then
+        local moved = (myPos - state.lastPos).Magnitude
+        if moved < 0.15 then
+            state.moveFailCount = state.moveFailCount + 1
+            -- За 3 тика (0.15 сек) не сдвинулись — меняем метод
+            if state.moveFailCount >= 3 and tick() > state.methodSwitchUntil then
+                local methods = { "moveto", "velocity", "move" }
+                local idx = table.find(methods, state.lastMoveMethod) or 1
+                state.lastMoveMethod = methods[(idx % #methods) + 1]
+                state.methodSwitchUntil = now + 2
+                state.moveFailCount = 0
+                bd("method switch -> " .. state.lastMoveMethod)
+            end
         else
-            state.yDropTimer = math.max(0, state.yDropTimer - 0.05)
+            state.moveFailCount = 0
         end
     end
-    state.lastY = myY
-
-    if state.yDropTimer > 0.4 then
-        bd("falling detected -> escape")
-        state.escapeUntil = now + Config.escapeDuration
-        state.yDropTimer = 0
-    end
+    state.lastPos = myPos
 
     -- Escape mode
     if now < state.escapeUntil then
@@ -329,11 +387,11 @@ local function tick()
             humanoid.WalkSpeed = Config.walkSpeed + 2
             moveHumanoid(humanoid, myRoot, escapeDir)
         else
-            humanoid:Move(Vector3.zero, false)
+            stopHumanoid(humanoid, myRoot)
         end
-        if tick() - state.lastJump > Config.escapeJumpCooldown then
+        if now - state.lastJump > Config.escapeJumpCooldown then
             humanoid.Jump = true
-            state.lastJump = tick()
+            state.lastJump = now
         end
         return
     end
@@ -350,12 +408,15 @@ local function tick()
             local tree, dist = findTree()
             if tree then
                 state.currentTarget = tree
-                bd(string.format("target: %s (%.0fm)", tree.Name, dist or 0))
+                if Config.debug and now - state.lastLogTime > 2 then
+                    bd(string.format("target: %s (%.0fm)", tree.Name, dist or 0))
+                    state.lastLogTime = now
+                end
             end
         end
     end
 
-    -- НЕТ ЦЕЛИ — бродим
+    -- Нет цели — wander
     if not state.currentTarget then
         if not state.wanderDir or now - state.wanderChangeAt > Config.wanderInterval then
             local angle = math.random() * math.pi * 2
@@ -368,7 +429,7 @@ local function tick()
 
     local goalDir, dist = getTargetDirection(state.currentTarget)
     if not goalDir or dist < Config.targetReachDistance then
-        humanoid:Move(Vector3.zero, false)
+        stopHumanoid(humanoid, myRoot)
         return
     end
 
@@ -383,37 +444,13 @@ local function tick()
     if state.currentDir then
         moveHumanoid(humanoid, myRoot, state.currentDir)
         if state.pendingJump then
-            if tick() - state.lastJump > Config.pendingJumpCooldown then
+            if now - state.lastJump > Config.pendingJumpCooldown then
                 humanoid.Jump = true
-                state.lastJump = tick()
+                state.lastJump = now
             end
-        end
-    end
-
-    -- Anti-stuck
-    if state.lastPos then
-        local moved = (myRoot.Position - state.lastPos).Magnitude
-        state.lastPos = myRoot.Position
-
-        if moved < 0.15 then
-            state.stuckTimer = state.stuckTimer + Config.tickRate
-            if state.stuckTimer > Config.stuckJumpTime then
-                if tick() - state.lastJump > 0.5 then
-                    humanoid.Jump = true
-                    state.lastJump = tick()
-                end
-            end
-            if state.stuckTimer > Config.stuckResetTime then
-                state.currentDir = nil
-                state.stuckTimer = 0
-                state.wanderDir = nil
-                state.wanderChangeAt = 0
-            end
-        else
-            state.stuckTimer = math.max(0, state.stuckTimer - 0.1)
         end
     else
-        state.lastPos = myRoot.Position
+        stopHumanoid(humanoid, myRoot)
     end
 end
 
@@ -424,14 +461,15 @@ function Baritone.Start()
     if state.running then return end
     state.running = true
     Config.enabled = true
-    state.lastY = nil
-    state.yDropTimer = 0
-    state.stuckTimer = 0
+    state.lastPos = nil
+    state.moveFailCount = 0
+    state.methodSwitchUntil = 0
+    state.lastMoveMethod = "move"
     state.escapeUntil = 0
     state.wanderDir = nil
     state.wanderChangeAt = 0
     state.currentDir = nil
-    state.lastPos = nil
+    state.lastLogTime = 0
     bd("started v" .. Baritone.Version)
 
     state.thread = task.spawn(function()
@@ -441,7 +479,9 @@ function Baritone.Start()
             task.wait(Config.tickRate)
         end
         local h = getHumanoid()
+        local r = getRoot()
         if h then h:Move(Vector3.zero, false) end
+        clearVelocity(r)
     end)
 end
 
@@ -456,7 +496,9 @@ function Baritone.Stop()
         state.thread = nil
     end
     local h = getHumanoid()
+    local r = getRoot()
     if h then h:Move(Vector3.zero, false) end
+    clearVelocity(r)
     for _, cb in ipairs(state.stopCallbacks) do pcall(cb) end
 end
 
@@ -475,6 +517,20 @@ function Baritone.GetAllConfig()
 end
 function Baritone.OnStop(cb)
     table.insert(state.stopCallbacks, cb)
+end
+function Baritone.DebugInfo()
+    local h = getHumanoid()
+    local r = getRoot()
+    return {
+        running = state.running,
+        target = state.currentTarget and state.currentTarget.Name or "nil",
+        dir = state.currentDir,
+        method = state.lastMoveMethod,
+        state = h and h:GetState() or nil,
+        pos = r and r.Position or nil,
+        vel = r and r.Velocity or nil,
+        moveFailCount = state.moveFailCount,
+    }
 end
 
 return Baritone
