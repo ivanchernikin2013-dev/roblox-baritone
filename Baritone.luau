@@ -1,24 +1,18 @@
--- ============================================================
--- Herkle Baritone v1.2.0
--- Walk-only baritone for Booga Booga Reborn
--- GitHub: ivanchernikin2013-dev/roblox-baritone
--- ============================================================
-
 local Players = game:GetService("Players")
 local plr = Players.LocalPlayer
 
 local Baritone = {}
-Baritone.Version = "1.2.0"
+Baritone.Version = "1.3.0"
 
 local DEFAULTS = {
     walkSpeed = 14,
-    searchRange = 150,
-    avoidWater = true,
+    searchRange = 250,
+    avoidWater = false,
     avoidCliffs = true,
     jumpHeight = 3,
     cliffDrop = 6,
     targetReachDistance = 5,
-    tickRate = 0.03,
+    tickRate = 0.05,
     escapeDuration = 3,
     escapeJumpCooldown = 0.6,
     stuckJumpTime = 1,
@@ -26,6 +20,7 @@ local DEFAULTS = {
     pendingJumpCooldown = 0.35,
     dirUpdateInterval = 0.25,
     targetSearchInterval = 0.5,
+    wanderInterval = 4,
     enabled = false,
     debug = false,
     TREE_NAMES = {
@@ -51,7 +46,6 @@ end
 -- ============================================================
 -- UTIL
 -- ============================================================
-local function getCharacter() return plr.Character end
 local function getRoot()
     local c = plr.Character
     return c and c:FindFirstChild("HumanoidRootPart")
@@ -70,7 +64,6 @@ local function makeParams()
     local p = RaycastParams.new()
     p.FilterType = Enum.RaycastFilterType.Exclude
     p.IgnoreWater = false
-    p.RespectCanCollide = false
     local list = {}
     local char = plr.Character
     if char then table.insert(list, char) end
@@ -84,11 +77,6 @@ local function raycast(from, to)
         return workspace:Raycast(from, to - from, makeParams())
     end)
     return ok and hit or nil
-end
-
-local function raycastDir(from, dir, length)
-    if not from or not dir then return nil end
-    return raycast(from, from + dir.Unit * length)
 end
 
 local function getGroundY(pos, maxDist)
@@ -116,8 +104,7 @@ local function checkWaterAt(pos)
 end
 
 local function isInWater(myRoot)
-    if not myRoot then return false end
-    return checkWaterAt(myRoot.Position)
+    return myRoot and checkWaterAt(myRoot.Position)
 end
 
 -- ============================================================
@@ -191,13 +178,13 @@ end
 -- ============================================================
 -- DIRECTION EVALUATION
 -- ============================================================
-local function evaluateDirection(myRoot, dir)
+local function evaluateDirection(myRoot, dir, inWater)
     local myY = myRoot.Position.Y
     local origin = myRoot.Position + Vector3.new(0, 1, 0)
     local score = 10
     local needJump = false
 
-    local hit1 = raycastDir(origin, dir, 2)
+    local hit1 = raycast(origin, origin + dir * 2)
     if hit1 then
         local diff = hit1.Position.Y - myY
         if diff > Config.jumpHeight + 1 then
@@ -225,7 +212,8 @@ local function evaluateDirection(myRoot, dir)
         end
     end
 
-    if Config.avoidWater then
+    -- Штраф за воду ТОЛЬКО если уже НЕ в воде
+    if Config.avoidWater and not inWater then
         local ahead = myRoot.Position + dir * 2
         if checkWaterAt(ahead) then
             score = score - 20
@@ -237,10 +225,10 @@ end
 
 local function findBestDirection(myRoot, goalDir)
     if not goalDir then return nil, false end
+    local inWater = isInWater(myRoot)
     local bestDir = nil
     local bestScore = -math.huge
     local bestJump = false
-    local inWater = isInWater(myRoot)
 
     for _, deg in ipairs(Config.DIR_ANGLES) do
         local rad = math.rad(deg)
@@ -249,12 +237,8 @@ local function findBestDirection(myRoot, goalDir)
             goalDir.X * cos - goalDir.Z * sin, 0,
             goalDir.X * sin + goalDir.Z * cos
         ).Unit
-        local score, needJump = evaluateDirection(myRoot, testDir)
-        score = score - math.abs(deg) * 0.15
-        -- если уже в воде — не штрафуем за воду
-        if inWater then
-            score = score + 20
-        end
+        local score, needJump = evaluateDirection(myRoot, testDir, inWater)
+        score = score - math.abs(deg) * 0.1
         if score > bestScore then
             bestScore = score
             bestDir = testDir
@@ -262,13 +246,8 @@ local function findBestDirection(myRoot, goalDir)
         end
     end
 
-    -- Всегда возвращаем направление — не блокируем движение
-    if bestScore < -8 and not inWater then
-        return goalDir, bestJump
-    end
-    if not bestDir then
-        return goalDir, false
-    end
+    -- Никогда не возвращаем nil — всегда едем хоть куда-то
+    if not bestDir then return goalDir, false end
     return bestDir, bestJump
 end
 
@@ -284,7 +263,8 @@ local function findEscapeDirection(myRoot)
         local ahead = myRoot.Position + dir * 4
         local gY = getGroundY(ahead, 25)
         if gY then
-            local hit = raycastDir(myRoot.Position + Vector3.new(0, 1, 0), dir, 3)
+            local hit = raycast(myRoot.Position + Vector3.new(0, 1, 0),
+                                myRoot.Position + Vector3.new(0, 1, 0) + dir * 3)
             local blocked = hit ~= nil and (hit.Position.Y - myRoot.Position.Y) > Config.jumpHeight + 1
             if not blocked and gY > bestY then
                 bestY = gY
@@ -296,7 +276,7 @@ local function findEscapeDirection(myRoot)
 end
 
 -- ============================================================
--- MOVEMENT HELPER (Move / MoveTo для воды и падения)
+-- MOVE
 -- ============================================================
 local function moveHumanoid(humanoid, myRoot, dir)
     if not humanoid or not myRoot or not dir then return end
@@ -305,18 +285,10 @@ local function moveHumanoid(humanoid, myRoot, dir)
         or hs == Enum.HumanoidStateType.Freefall
         or hs == Enum.HumanoidStateType.FallingDown
         or hs == Enum.HumanoidStateType.Climbing then
-        humanoid:MoveTo(myRoot.Position + dir * 10)
+        humanoid:MoveTo(myRoot.Position + dir * 12)
     else
         humanoid:Move(dir, false)
     end
-end
-
-local function stopHumanoid(humanoid, myRoot)
-    if not humanoid then return end
-    if myRoot then
-        humanoid:MoveTo(myRoot.Position)
-    end
-    humanoid:Move(Vector3.zero, false)
 end
 
 -- ============================================================
@@ -357,7 +329,7 @@ local function tick()
             humanoid.WalkSpeed = Config.walkSpeed + 2
             moveHumanoid(humanoid, myRoot, escapeDir)
         else
-            stopHumanoid(humanoid, myRoot)
+            humanoid:Move(Vector3.zero, false)
         end
         if tick() - state.lastJump > Config.escapeJumpCooldown then
             humanoid.Jump = true
@@ -383,9 +355,9 @@ local function tick()
         end
     end
 
-    -- Нет цели — бродим в случайном направлении
+    -- НЕТ ЦЕЛИ — бродим
     if not state.currentTarget then
-        if not state.wanderDir or now - state.wanderChangeAt > 5 then
+        if not state.wanderDir or now - state.wanderChangeAt > Config.wanderInterval then
             local angle = math.random() * math.pi * 2
             state.wanderDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
             state.wanderChangeAt = now
@@ -396,7 +368,7 @@ local function tick()
 
     local goalDir, dist = getTargetDirection(state.currentTarget)
     if not goalDir or dist < Config.targetReachDistance then
-        stopHumanoid(humanoid, myRoot)
+        humanoid:Move(Vector3.zero, false)
         return
     end
 
@@ -416,8 +388,6 @@ local function tick()
                 state.lastJump = tick()
             end
         end
-    else
-        stopHumanoid(humanoid, myRoot)
     end
 
     -- Anti-stuck
@@ -436,7 +406,8 @@ local function tick()
             if state.stuckTimer > Config.stuckResetTime then
                 state.currentDir = nil
                 state.stuckTimer = 0
-                state.escapeUntil = now + 1.5
+                state.wanderDir = nil
+                state.wanderChangeAt = 0
             end
         else
             state.stuckTimer = math.max(0, state.stuckTimer - 0.1)
@@ -459,7 +430,9 @@ function Baritone.Start()
     state.escapeUntil = 0
     state.wanderDir = nil
     state.wanderChangeAt = 0
-    bd("started")
+    state.currentDir = nil
+    state.lastPos = nil
+    bd("started v" .. Baritone.Version)
 
     state.thread = task.spawn(function()
         while state.running do
@@ -468,8 +441,7 @@ function Baritone.Start()
             task.wait(Config.tickRate)
         end
         local h = getHumanoid()
-        local r = getRoot()
-        if h and r then h:MoveTo(r.Position) end
+        if h then h:Move(Vector3.zero, false) end
     end)
 end
 
@@ -484,30 +456,23 @@ function Baritone.Stop()
         state.thread = nil
     end
     local h = getHumanoid()
-    local r = getRoot()
-    if h and r then h:MoveTo(r.Position) end
-    for _, cb in ipairs(state.stopCallbacks) do
-        pcall(cb)
-    end
+    if h then h:Move(Vector3.zero, false) end
+    for _, cb in ipairs(state.stopCallbacks) do pcall(cb) end
 end
 
 function Baritone.IsRunning() return state.running end
-
 function Baritone.Set(key, value)
     if Config[key] == nil then return false end
     Config[key] = value
     return true
 end
-
 function Baritone.Get(key) return Config[key] end
 function Baritone.GetCurrentTarget() return state.currentTarget end
-
 function Baritone.GetAllConfig()
     local out = {}
     for k, v in pairs(Config) do out[k] = v end
     return out
 end
-
 function Baritone.OnStop(cb)
     table.insert(state.stopCallbacks, cb)
 end
