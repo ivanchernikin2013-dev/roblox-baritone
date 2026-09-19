@@ -1,14 +1,14 @@
 -- ============================================================
--- Herkle Baritone v1.1.0
+-- Herkle Baritone v1.2.0
 -- Walk-only baritone for Booga Booga Reborn
--- GitHub: ivanchernikin2013-dev/baritone-roblox
+-- GitHub: ivanchernikin2013-dev/roblox-baritone
 -- ============================================================
 
 local Players = game:GetService("Players")
 local plr = Players.LocalPlayer
 
 local Baritone = {}
-Baritone.Version = "1.1.0"
+Baritone.Version = "1.2.0"
 
 local DEFAULTS = {
     walkSpeed = 14,
@@ -100,7 +100,6 @@ local function getGroundY(pos, maxDist)
 end
 
 local function checkWaterAt(pos)
-    if not Config.avoidWater then return false end
     local ok, mat = pcall(function()
         return workspace.Terrain:ReadVoxels(
             Region3.new(pos - Vector3.new(1, 0.5, 1), pos + Vector3.new(1, 0.5, 1)), 4)
@@ -114,6 +113,11 @@ local function checkWaterAt(pos)
         end
     end
     return false
+end
+
+local function isInWater(myRoot)
+    if not myRoot then return false end
+    return checkWaterAt(myRoot.Position)
 end
 
 -- ============================================================
@@ -133,6 +137,8 @@ local state = {
     lastDirUpdate = 0,
     lastTargetSearch = 0,
     escapeUntil = 0,
+    wanderDir = nil,
+    wanderChangeAt = 0,
     stopCallbacks = {},
 }
 
@@ -234,6 +240,8 @@ local function findBestDirection(myRoot, goalDir)
     local bestDir = nil
     local bestScore = -math.huge
     local bestJump = false
+    local inWater = isInWater(myRoot)
+
     for _, deg in ipairs(Config.DIR_ANGLES) do
         local rad = math.rad(deg)
         local cos, sin = math.cos(rad), math.sin(rad)
@@ -243,13 +251,24 @@ local function findBestDirection(myRoot, goalDir)
         ).Unit
         local score, needJump = evaluateDirection(myRoot, testDir)
         score = score - math.abs(deg) * 0.15
+        -- если уже в воде — не штрафуем за воду
+        if inWater then
+            score = score + 20
+        end
         if score > bestScore then
             bestScore = score
             bestDir = testDir
             bestJump = needJump
         end
     end
-    if bestScore < -8 then return nil, bestJump end
+
+    -- Всегда возвращаем направление — не блокируем движение
+    if bestScore < -8 and not inWater then
+        return goalDir, bestJump
+    end
+    if not bestDir then
+        return goalDir, false
+    end
     return bestDir, bestJump
 end
 
@@ -277,6 +296,30 @@ local function findEscapeDirection(myRoot)
 end
 
 -- ============================================================
+-- MOVEMENT HELPER (Move / MoveTo для воды и падения)
+-- ============================================================
+local function moveHumanoid(humanoid, myRoot, dir)
+    if not humanoid or not myRoot or not dir then return end
+    local hs = humanoid:GetState()
+    if hs == Enum.HumanoidStateType.Swimming
+        or hs == Enum.HumanoidStateType.Freefall
+        or hs == Enum.HumanoidStateType.FallingDown
+        or hs == Enum.HumanoidStateType.Climbing then
+        humanoid:MoveTo(myRoot.Position + dir * 10)
+    else
+        humanoid:Move(dir, false)
+    end
+end
+
+local function stopHumanoid(humanoid, myRoot)
+    if not humanoid then return end
+    if myRoot then
+        humanoid:MoveTo(myRoot.Position)
+    end
+    humanoid:Move(Vector3.zero, false)
+end
+
+-- ============================================================
 -- MAIN TICK
 -- ============================================================
 local function tick()
@@ -290,6 +333,7 @@ local function tick()
     local now = tick()
     local myY = myRoot.Position.Y
 
+    -- Falling detection
     if state.lastY then
         local dY = state.lastY - myY
         if dY > 0.3 then
@@ -306,13 +350,14 @@ local function tick()
         state.yDropTimer = 0
     end
 
+    -- Escape mode
     if now < state.escapeUntil then
         local escapeDir = findEscapeDirection(myRoot)
         if escapeDir then
             humanoid.WalkSpeed = Config.walkSpeed + 2
-            humanoid:Move(escapeDir, false)
+            moveHumanoid(humanoid, myRoot, escapeDir)
         else
-            humanoid:Move(Vector3.zero, false)
+            stopHumanoid(humanoid, myRoot)
         end
         if tick() - state.lastJump > Config.escapeJumpCooldown then
             humanoid.Jump = true
@@ -323,6 +368,7 @@ local function tick()
 
     humanoid.WalkSpeed = Config.walkSpeed
 
+    -- Update target
     if now - state.lastTargetSearch > Config.targetSearchInterval then
         state.lastTargetSearch = now
         if state.currentTarget and not isTreeAlive(state.currentTarget) then
@@ -337,17 +383,24 @@ local function tick()
         end
     end
 
+    -- Нет цели — бродим в случайном направлении
     if not state.currentTarget then
-        humanoid:Move(Vector3.zero, false)
+        if not state.wanderDir or now - state.wanderChangeAt > 5 then
+            local angle = math.random() * math.pi * 2
+            state.wanderDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
+            state.wanderChangeAt = now
+        end
+        moveHumanoid(humanoid, myRoot, state.wanderDir)
         return
     end
 
     local goalDir, dist = getTargetDirection(state.currentTarget)
     if not goalDir or dist < Config.targetReachDistance then
-        humanoid:Move(Vector3.zero, false)
+        stopHumanoid(humanoid, myRoot)
         return
     end
 
+    -- Recalculate direction
     if now - state.lastDirUpdate > Config.dirUpdateInterval or not state.currentDir then
         state.lastDirUpdate = now
         local bestDir, needJump = findBestDirection(myRoot, goalDir)
@@ -356,7 +409,7 @@ local function tick()
     end
 
     if state.currentDir then
-        humanoid:Move(state.currentDir, false)
+        moveHumanoid(humanoid, myRoot, state.currentDir)
         if state.pendingJump then
             if tick() - state.lastJump > Config.pendingJumpCooldown then
                 humanoid.Jump = true
@@ -364,9 +417,10 @@ local function tick()
             end
         end
     else
-        humanoid:Move(Vector3.zero, false)
+        stopHumanoid(humanoid, myRoot)
     end
 
+    -- Anti-stuck
     if state.lastPos then
         local moved = (myRoot.Position - state.lastPos).Magnitude
         state.lastPos = myRoot.Position
@@ -403,6 +457,8 @@ function Baritone.Start()
     state.yDropTimer = 0
     state.stuckTimer = 0
     state.escapeUntil = 0
+    state.wanderDir = nil
+    state.wanderChangeAt = 0
     bd("started")
 
     state.thread = task.spawn(function()
@@ -412,7 +468,8 @@ function Baritone.Start()
             task.wait(Config.tickRate)
         end
         local h = getHumanoid()
-        if h then h:Move(Vector3.zero, false) end
+        local r = getRoot()
+        if h and r then h:MoveTo(r.Position) end
     end)
 end
 
@@ -427,7 +484,8 @@ function Baritone.Stop()
         state.thread = nil
     end
     local h = getHumanoid()
-    if h then h:Move(Vector3.zero, false) end
+    local r = getRoot()
+    if h and r then h:MoveTo(r.Position) end
     for _, cb in ipairs(state.stopCallbacks) do
         pcall(cb)
     end
